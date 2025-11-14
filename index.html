@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>OBJ Freecam Viewer</title>
+<style>
+  html,body { height:100%; margin:0; font-family: system-ui, Arial; background:#111; color:#ddd; }
+  #ui { position: absolute; top: 10px; left: 10px; z-index: 10; background: rgba(0,0,0,0.4); padding:10px; border-radius:8px; }
+  #canvas-container { width:100%; height:100vh; overflow:hidden; }
+  button,input { margin:4px 0; display:block; }
+  #help { font-size:13px; opacity:0.9; margin-top:6px; }
+  #loading { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:20; display:none; }
+</style>
+</head>
+<body>
+<div id="ui">
+  <label><strong>Load model (.obj)</strong></label>
+  <input id="objFile" type="file" accept=".obj" />
+  <label>Optional .mtl</label>
+  <input id="mtlFile" type="file" accept=".mtl" />
+  <button id="resetBtn">Reset Camera / Scene</button>
+  <div id="help">
+    Click the canvas to lock mouse & enable look. Controls: <strong>W A S D</strong>, Space = up, Shift = faster, Scroll = zoom (if unlocked).<br>
+    Use OBJ + MTL from the same model for materials (select MTL after selecting OBJ or at any time).
+  </div>
+</div>
+
+<div id="loading">Loading model...</div>
+<div id="canvas-container"></div>
+
+<!-- three.js and loaders via module imports -->
+<script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+  import { PointerLockControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/PointerLockControls.js';
+  import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+  import { OBJLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/OBJLoader.js';
+  import { MTLLoader } from 'https://unpkg.com/three@0.160.0/examples/jsm/loaders/MTLLoader.js';
+
+  // scene + renderer
+  const container = document.getElementById('canvas-container');
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a1a);
+
+  const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+  camera.position.set(0, 1.6, 5);
+
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  container.appendChild(renderer.domElement);
+
+  // lights
+  const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.9);
+  hemi.position.set(0, 200, 0);
+  scene.add(hemi);
+
+  const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir.position.set(5, 10, 7.5);
+  scene.add(dir);
+
+  // ground grid
+  const grid = new THREE.GridHelper(200, 200, 0x333333, 0x222222);
+  grid.position.y = 0;
+  scene.add(grid);
+
+  // controls: pointer lock (FPS) + fallback orbit
+  const controls = new PointerLockControls(camera, renderer.domElement);
+  let orbit = new OrbitControls(camera, renderer.domElement); // for use when unlocked
+  orbit.enabled = false;
+  orbit.target.set(0,1,0);
+
+  // UI elements
+  const objInput = document.getElementById('objFile');
+  const mtlInput = document.getElementById('mtlFile');
+  const loadingEl = document.getElementById('loading');
+  const resetBtn = document.getElementById('resetBtn');
+
+  // movement state
+  const move = { forward:false, back:false, left:false, right:false, up:false, boost:false };
+  const velocity = new THREE.Vector3();
+  const direction = new THREE.Vector3();
+
+  // pointer lock setup
+  renderer.domElement.addEventListener('click', () => {
+    // request pointer lock to enable mouselook
+    if (document.pointerLockElement !== renderer.domElement) {
+      renderer.domElement.requestPointerLock();
+    }
+  });
+  document.addEventListener('pointerlockchange', () => {
+    const locked = document.pointerLockElement === renderer.domElement;
+    controls.enabled = locked;
+    orbit.enabled = !locked;
+  });
+
+  // keyboard
+  function onKeyDown(e) {
+    switch (e.code) {
+      case 'KeyW': move.forward = true; break;
+      case 'KeyS': move.back = true; break;
+      case 'KeyA': move.left = true; break;
+      case 'KeyD': move.right = true; break;
+      case 'Space': move.up = true; break;
+      case 'ShiftLeft':
+      case 'ShiftRight': move.boost = true; break;
+    }
+  }
+  function onKeyUp(e) {
+    switch (e.code) {
+      case 'KeyW': move.forward = false; break;
+      case 'KeyS': move.back = false; break;
+      case 'KeyA': move.left = false; break;
+      case 'KeyD': move.right = false; break;
+      case 'Space': move.up = false; break;
+      case 'ShiftLeft':
+      case 'ShiftRight': move.boost = false; break;
+    }
+  }
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+
+  // OBJ/MTL handling
+  const objLoader = new OBJLoader();
+  const mtlLoader = new MTLLoader();
+
+  let modelGroup = new THREE.Group();
+  scene.add(modelGroup);
+
+  function showLoading(on) { loadingEl.style.display = on ? 'block' : 'none'; }
+
+  async function loadFiles(objFile, mtlFile) {
+    if (!objFile) return;
+    showLoading(true);
+
+    // helpers to read file as text or blob URL
+    function fileToText(file) {
+      return new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload = () => res(r.result);
+        r.onerror = rej;
+        r.readAsText(file);
+      });
+    }
+    function fileToBlobURL(file) {
+      return URL.createObjectURL(file);
+    }
+
+    // clear previous
+    while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
+
+    try {
+      if (mtlFile) {
+        // load MTL (and set materials on OBJ)
+        const mtlText = await fileToText(mtlFile);
+        // MTLLoader can load from url or parse text; but parse requires using setMaterials from mgr.
+        // Trick: create blob URL and let MTLLoader load it.
+        const mtlUrl = fileToBlobURL(mtlFile);
+        mtlLoader.load(mtlUrl, (materials) => {
+          materials.preload();
+          objLoader.setMaterials(materials);
+          const objUrl = fileToBlobURL(objFile);
+          objLoader.load(objUrl, (obj) => {
+            finalizeModel(obj);
+            URL.revokeObjectURL(objUrl);
+            URL.revokeObjectURL(mtlUrl);
+            showLoading(false);
+          }, xhrProgress, onLoadError);
+        }, xhrProgress, onLoadError);
+      } else {
+        const objUrl = fileToBlobURL(objFile);
+        objLoader.load(objUrl, (obj) => {
+          finalizeModel(obj);
+          URL.revokeObjectURL(objUrl);
+          showLoading(false);
+        }, xhrProgress, onLoadError);
+      }
+    } catch (err) {
+      console.error('Load error', err);
+      showLoading(false);
+      alert('Error loading file: ' + err.message);
+    }
+  }
+
+  function xhrProgress(xhr) {
+    // optional: can display percent
+  }
+  function onLoadError(err) {
+    console.error('Loader error', err);
+    showLoading(false);
+    alert('Error loading model (check console).');
+  }
+
+  function finalizeModel(obj) {
+    // center and scale model to reasonable size
+    const box = new THREE.Box3().setFromObject(obj);
+    const size = box.getSize(new THREE.Vector3()).length();
+    const center = box.getCenter(new THREE.Vector3());
+
+    if (size > 0) {
+      const scale = 4.0 / size; // aim for a bounding length of ~4 units
+      obj.scale.setScalar(scale);
+      obj.position.sub(center.multiplyScalar(scale)); // center
+    }
+
+    modelGroup.add(obj);
+    // place camera to see model if not in pointer lock: move orbit target
+    orbit.target.set(0, 1, 0);
+    camera.position.set(0, Math.max(1.6, (box.max.y - box.min.y) * 0.5 * (1/ (size||1)) * 2), 5);
+  }
+
+  objInput.addEventListener('change', (ev) => {
+    const f = ev.target.files[0];
+    if (!f) return;
+    const m = mtlInput.files[0];
+    loadFiles(f, m);
+  });
+
+  mtlInput.addEventListener('change', (ev) => {
+    const objFile = objInput.files[0];
+    if (!objFile) { alert('Choose the OBJ file first (or choose both).'); return; }
+    loadFiles(objFile, ev.target.files[0]);
+  });
+
+  resetBtn.addEventListener('click', () => {
+    while (modelGroup.children.length) modelGroup.remove(modelGroup.children[0]);
+    camera.position.set(0,1.6,5);
+    camera.rotation.set(0,0,0);
+    controls.getObject().position.set(0,1.6,5);
+    orbit.target.set(0,1,0);
+  });
+
+  // basic animation + movement update
+  const clock = new THREE.Clock();
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const delta = Math.min(0.1, clock.getDelta());
+    // move only when pointer lock active (controls.enabled)
+    if (controls.enabled) {
+      // compute direction relative to camera orientation
+      direction.set(0,0,0);
+      if (move.forward) direction.z -= 1;
+      if (move.back) direction.z += 1;
+      if (move.left) direction.x -= 1;
+      if (move.right) direction.x += 1;
+      if (move.up) direction.y += 1;
+      direction.normalize();
+
+      // speed
+      const baseSpeed = 5; // units per second
+      const speed = baseSpeed * (move.boost ? 3 : 1);
+
+      // transform direction by camera rotation
+      const camQuat = camera.quaternion.clone();
+      const worldDir = direction.clone().applyQuaternion(camQuat);
+      velocity.lerp(worldDir.multiplyScalar(speed), 0.2); // smooth
+      controls.getObject().position.addScaledVector(velocity, delta);
+    } else {
+      // update orbit controls when unlocked
+      orbit.update();
+    }
+
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  // resize
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // expose helpful info when pointer locked
+  controls.addEventListener('lock', () => { /* could show HUD */ });
+  controls.addEventListener('unlock', () => { /* */ });
+
+  // optional: drop files directly onto the canvas
+  function handleDrop(e) {
+    e.preventDefault();
+    if (!e.dataTransfer) return;
+    const files = Array.from(e.dataTransfer.files);
+    const obj = files.find(f => f.name.toLowerCase().endsWith('.obj'));
+    const mtl = files.find(f => f.name.toLowerCase().endsWith('.mtl'));
+    if (obj) {
+      objInput.files = new DataTransfer().files; // clear
+      // We cannot easily set input.files in all browsers; instead directly call loader
+      loadFiles(obj, mtl);
+    }
+  }
+  renderer.domElement.addEventListener('dragover', (e)=> e.preventDefault());
+  renderer.domElement.addEventListener('drop', handleDrop);
+</script>
+</body>
+</html>
+ok 
